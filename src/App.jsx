@@ -487,7 +487,242 @@ function Calendar({expenses,month,year,dc,rate,varCats,onNav,theme}){
   );
 }
 
-// navBtn, smallBtn, ifield, lbl are now computed inside App with theme access
+// ─── STORAGE SERVICE ─────────────────────────────────────────────────────────
+// Centralized read/write with validation and graceful recovery
+const store = {
+  get(key, def) {
+    try {
+      if (!_storage) return def;
+      const raw = _storage.getItem(key);
+      if (raw === null) return def;
+      const parsed = JSON.parse(raw);
+      // Basic type validation — if expected type is array and got non-array, recover
+      if (Array.isArray(def) && !Array.isArray(parsed)) return def;
+      return parsed;
+    } catch { return def; }
+  },
+  set(key, val) {
+    try { if (_storage) _storage.setItem(key, JSON.stringify(val)); } catch {}
+  },
+  remove(key) {
+    try { if (_storage) _storage.removeItem(key); } catch {}
+  },
+  keys() {
+    const result = [];
+    try { if (_storage) for (let i = 0; i < _storage.length; i++) { const k = _storage.key(i); if (k) result.push(k); } } catch {}
+    return result;
+  }
+};
+
+// ─── SECURITY / PIN SERVICE ───────────────────────────────────────────────────
+const SEC_KEY    = "vw_g_sec";          // {enabled, hash, autoLock, createdAt}
+const LOCK_KEY   = "vw_g_locked";       // timestamp of last unlock (session)
+
+async function sha256(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,"0")).join("");
+}
+
+function secLoad() {
+  return store.get(SEC_KEY, { enabled: false, hash: null, autoLock: 15, createdAt: null });
+}
+function secSave(obj) { store.set(SEC_KEY, obj); }
+
+// Returns true if the app should currently show the lock screen
+function shouldLock(sec) {
+  if (!sec.enabled || !sec.hash) return false;
+  // Always lock after browser restart (sessionStorage cleared)
+  try {
+    const unlocked = sessionStorage.getItem("vw_unlocked");
+    if (!unlocked) return true;
+    if (sec.autoLock === 0) return false; // Never
+    const elapsed = (Date.now() - parseInt(unlocked, 10)) / 60000;
+    return elapsed >= sec.autoLock;
+  } catch { return true; }
+}
+function recordUnlock() {
+  try { sessionStorage.setItem("vw_unlocked", String(Date.now())); } catch {}
+}
+function clearUnlock() {
+  try { sessionStorage.removeItem("vw_unlocked"); } catch {}
+}
+
+// ─── LOCK SCREEN COMPONENT ───────────────────────────────────────────────────
+function LockScreen({ onUnlock, theme }) {
+  const dark = theme !== "light";
+  const T2 = {
+    bg:   dark ? "#0d0d18" : "#f0f0f8",
+    card: dark ? "#12121e" : "#ffffff",
+    txt:  dark ? "#e8e4f0" : "#1a1a2a",
+    sub:  dark ? "#666"    : "#888",
+    bdr:  dark ? "rgba(255,255,255,.08)" : "rgba(0,0,0,.1)",
+  };
+  const [pin,    setPin]    = useState("");
+  const [error,  setError]  = useState("");
+  const [shaking,setShaking]= useState(false);
+
+  function press(digit) {
+    if (pin.length >= 6) return;
+    setPin(p => p + digit);
+    setError("");
+  }
+  function del() { setPin(p => p.slice(0, -1)); setError(""); }
+
+  async function submit(pinStr) {
+    const sec = secLoad();
+    const h = await sha256(pinStr);
+    if (h === sec.hash) {
+      recordUnlock();
+      onUnlock();
+    } else {
+      setShaking(true);
+      setError("Incorrect PIN");
+      setPin("");
+      setTimeout(() => setShaking(false), 500);
+    }
+  }
+
+  // Auto-submit when enough digits entered
+  useEffect(() => {
+    const sec = secLoad();
+    const pinLen = sec.hash && sec.hash.length > 0 ? (secLoad().pinLen || 4) : 4;
+    if (pin.length === pinLen) { submit(pin); }
+  }, [pin]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const DIGITS = ["1","2","3","4","5","6","7","8","9","","0","⌫"];
+
+  return (
+    <div style={{minHeight:"100vh",background:T2.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,fontFamily:"system-ui,sans-serif"}}>
+      <div style={{fontSize:40,marginBottom:12}}>🔐</div>
+      <div style={{fontSize:20,fontWeight:800,color:T2.txt,marginBottom:6}}>Varun Wallet</div>
+      <div style={{fontSize:12,color:T2.sub,marginBottom:32}}>Enter your PIN to continue</div>
+
+      {/* PIN dots */}
+      <div style={{display:"flex",gap:14,marginBottom:24,animation:shaking?"shake .4s ease":"none"}}>
+        {Array.from({length:6}).map((_,i)=>{
+          const sec=secLoad();
+          const len=sec.pinLen||4;
+          if(i>=len) return null;
+          return (
+            <div key={i} style={{width:14,height:14,borderRadius:"50%",border:"2px solid "+(pin.length>i?"#7c6aff":T2.bdr),background:pin.length>i?"#7c6aff":"transparent",transition:"all .15s"}}/>
+          );
+        })}
+      </div>
+
+      {error&&<div style={{fontSize:11,color:"#FF6B6B",marginBottom:16,fontWeight:600}}>{error}</div>}
+
+      {/* Keypad */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,72px)",gap:10,maxWidth:240}}>
+        {DIGITS.map((d,i)=>(
+          d===""?<div key={i}/>:
+          <button key={i} onClick={()=>d==="⌫"?del():press(d)}
+            style={{height:64,borderRadius:16,background:T2.card,border:"1px solid "+T2.bdr,color:T2.txt,fontSize:d==="⌫"?20:22,fontWeight:700,cursor:"pointer",transition:"background .1s",display:"flex",alignItems:"center",justifyContent:"center"}}
+            onMouseDown={e=>e.currentTarget.style.background=dark?"rgba(124,106,255,.2)":"rgba(124,106,255,.12)"}
+            onMouseUp={e=>e.currentTarget.style.background=T2.card}>
+            {d}
+          </button>
+        ))}
+      </div>
+
+      <style>{`@keyframes shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-8px)}40%,80%{transform:translateX(8px)}}`}</style>
+    </div>
+  );
+}
+
+// ─── PIN SETUP COMPONENT ─────────────────────────────────────────────────────
+function PinSetup({ mode, onDone, onCancel, theme }) {
+  // mode: "create" | "change" | "disable" | "verify"
+  const dark = theme !== "light";
+  const T2 = {
+    txt: dark?"#e8e4f0":"#1a1a2a", sub: dark?"#666":"#888",
+    card:dark?"#1a1a2a":"#f5f5fb", bdr: dark?"rgba(255,255,255,.1)":"rgba(0,0,0,.1)",
+  };
+  const [step,    setStep]    = useState(mode==="create"||mode==="change"?"enter_new":"verify_old");
+  const [pin,     setPin]     = useState("");
+  const [newPin,  setNewPin]  = useState("");
+  const [pinLen,  setPinLen]  = useState(4);
+  const [error,   setError]   = useState("");
+  const [shaking, setShaking] = useState(false);
+  const [isBusy,  setIsBusy]  = useState(false);
+
+  const stepLabel = {
+    verify_old: "Enter current PIN",
+    enter_new:  mode==="create"?"Create a PIN":"Enter new PIN",
+    confirm_new:"Confirm PIN",
+  }[step];
+
+  const digits = pin.length;
+
+  function press(d) { if(digits<pinLen) setPin(p=>p+d); setError(""); }
+  function del()    { setPin(p=>p.slice(0,-1)); setError(""); }
+
+  function shake(msg) {
+    setShaking(true); setError(msg); setPin("");
+    setTimeout(()=>setShaking(false),500);
+  }
+
+  async function advance(p) {
+    setIsBusy(true);
+    try {
+      if (step==="verify_old") {
+        const sec=secLoad();
+        const h=await sha256(p);
+        if(h!==sec.hash){shake("Incorrect PIN");return;}
+        if(mode==="disable"){ sec.enabled=false;sec.hash=null;sec.createdAt=null;secSave(sec);clearUnlock();onDone("PIN disabled"); return; }
+        setNewPin(""); setStep("enter_new");
+      } else if(step==="enter_new") {
+        setNewPin(p); setStep("confirm_new");
+      } else if(step==="confirm_new") {
+        if(p!==newPin){shake("PINs do not match");setStep("enter_new");setNewPin("");return;}
+        const h=await sha256(p);
+        const sec=secLoad();
+        sec.enabled=true; sec.hash=h; sec.pinLen=pinLen; sec.createdAt=Date.now();
+        secSave(sec); recordUnlock();
+        onDone(mode==="create"?"PIN enabled":"PIN changed");
+      }
+      setPin("");
+    } finally { setIsBusy(false); }
+  }
+
+  // Auto-submit
+  useEffect(()=>{
+    if(pin.length===pinLen&&!isBusy) advance(pin);
+  },[pin]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const KEYS=["1","2","3","4","5","6","7","8","9","","0","⌫"];
+
+  return (
+    <div style={{padding:"8px 0"}}>
+      {(mode==="create"||step==="enter_new")&&mode!=="change"&&mode!=="disable"&&step==="enter_new"&&(
+        <div style={{display:"flex",gap:8,marginBottom:16,justifyContent:"center"}}>
+          {[4,6].map(l=>(
+            <button key={l} onClick={()=>{setPinLen(l);setPin("");}}
+              style={{background:pinLen===l?"linear-gradient(135deg,#7c6aff,#c084fc)":"transparent",border:"1px solid "+(pinLen===l?"transparent":T2.bdr),borderRadius:8,padding:"5px 14px",color:pinLen===l?"#fff":T2.sub,fontSize:11,fontWeight:700,cursor:"pointer"}}>
+              {l}-digit
+            </button>
+          ))}
+        </div>
+      )}
+      <div style={{textAlign:"center",fontSize:12,color:T2.sub,marginBottom:14,fontWeight:600}}>{stepLabel}</div>
+      <div style={{display:"flex",gap:12,justifyContent:"center",marginBottom:16,animation:shaking?"shake .4s":"none"}}>
+        {Array.from({length:pinLen}).map((_,i)=>(
+          <div key={i} style={{width:12,height:12,borderRadius:"50%",border:"2px solid "+(pin.length>i?"#7c6aff":T2.bdr),background:pin.length>i?"#7c6aff":"transparent",transition:"all .15s"}}/>
+        ))}
+      </div>
+      {error&&<div style={{fontSize:10,color:"#FF6B6B",textAlign:"center",marginBottom:10,fontWeight:600}}>{error}</div>}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:7}}>
+        {KEYS.map((d,i)=>(
+          d===""?<div key={i}/>:
+          <button key={i} onClick={()=>d==="⌫"?del():press(d)}
+            style={{height:52,borderRadius:12,background:T2.card,border:"1px solid "+T2.bdr,color:T2.txt,fontSize:d==="⌫"?18:18,fontWeight:700,cursor:"pointer"}}>
+            {d}
+          </button>
+        ))}
+      </div>
+      <button onClick={onCancel} style={{marginTop:14,width:"100%",background:"none",border:"none",color:T2.sub,fontSize:11,cursor:"pointer"}}>Cancel</button>
+    </div>
+  );
+}
 
 // ─── APP ──────────────────────────────────────────────────────────────────────
 export default function App(){
@@ -564,7 +799,26 @@ export default function App(){
   const [nFC,     setNFC]     =useState({label:"",icon:"🔒",defCur:"AED",defDue:1});
   const [nIC,     setNIC]     =useState({label:"",icon:"💵",defCur:"AED"});
 
-  // ── load / persist ────────────────────────────────────────────────────────
+  // ── security ──
+  const [sec,      setSec]      =useState(()=>secLoad());
+  const [locked,   setLocked]   =useState(()=>shouldLock(secLoad()));
+  const [secModal, setSecModal] =useState(null); // "create"|"change"|"disable"|null
+  const lastActivity=useRef(Date.now());
+
+  // Auto-lock timer
+  useEffect(()=>{
+    if(!sec.enabled||sec.autoLock===0) return;
+    function onActivity(){ lastActivity.current=Date.now(); }
+    function checkLock(){
+      if(Date.now()-lastActivity.current >= sec.autoLock*60*1000){
+        setLocked(true); clearUnlock();
+      }
+    }
+    const events=["mousedown","keydown","touchstart","scroll"];
+    events.forEach(ev=>window.addEventListener(ev,onActivity,{passive:true}));
+    const interval=setInterval(checkLock,30000);
+    return ()=>{ events.forEach(ev=>window.removeEventListener(ev,onActivity)); clearInterval(interval); };
+  },[sec.enabled,sec.autoLock]);
   // isFirstMount: on initial mount, state is already populated by lazy useState above.
   // This effect only fires when user navigates to a DIFFERENT month.
   const isFirstMount=useRef(true);
@@ -1010,6 +1264,9 @@ export default function App(){
   const TABS=[{id:"home",icon:"⊞",label:"Home"},{id:"charts",icon:"◎",label:"Charts"},{id:"log",icon:"≡",label:"Log"},{id:"manage",icon:"⚙",label:"Manage"}];
 
   // ── RENDER ────────────────────────────────────────────────────────────────
+  // Show lock screen if PIN is enabled and app is locked
+  if(locked) return <LockScreen theme={theme} onUnlock={()=>setLocked(false)}/>;
+
   return (
     <div style={{minHeight:"100vh",background:T.bg,fontFamily:"system-ui,sans-serif",color:T.txt,paddingBottom:84}}>
       <style>{`
@@ -1174,7 +1431,8 @@ export default function App(){
              modal==="goal"    ?"Savings Goal":
              modal==="loan"    ?"Loan to Friend":
              modal==="recur"   ?"Recurring Expenses":
-             modal==="inrwallet"?"India Account":""}
+             modal==="inrwallet"?"India Account":
+             modal==="security" ?"Security":""}
           </div>
           <button style={{background:"none",border:"none",cursor:"pointer",color:T.sub,fontSize:18}} onClick={()=>setModal(null)}>x</button>
         </div>
@@ -1347,6 +1605,69 @@ export default function App(){
           <span style={LB}>Current Balance (rupees)</span>
           <input style={{...IF,marginBottom:14}} type="number" value={eInrW.balance||0} onChange={e=>setEInrW(f=>({...f,balance:e.target.value}))}/>
           <button className="btnP" onClick={()=>{ setInrW(eInrW); setModal(null); showToast("Saved"); }}>Save</button>
+        </>}
+
+        {modal==="security"&&<>
+          {secModal?(
+            <PinSetup
+              mode={secModal}
+              theme={theme}
+              onDone={(msg)=>{ setSec(secLoad()); setSecModal(null); showToast(msg); }}
+              onCancel={()=>setSecModal(null)}
+            />
+          ):(
+            <>
+              {/* PIN toggle */}
+              <div style={{background:T.row,borderRadius:12,padding:"14px",marginBottom:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div>
+                    <div style={{fontSize:13,fontWeight:700,color:T.txt}}>PIN Protection</div>
+                    <div style={{fontSize:10,color:T.sub,marginTop:2}}>{sec.enabled?"Enabled — app locks on close":"Disabled"}</div>
+                  </div>
+                  <button onClick={()=>setSecModal(sec.enabled?"disable":"create")}
+                    style={{background:sec.enabled?"rgba(255,107,107,.12)":"linear-gradient(135deg,#7c6aff,#c084fc)",border:"1px solid "+(sec.enabled?"rgba(255,107,107,.3)":"transparent"),borderRadius:10,padding:"7px 14px",color:sec.enabled?"#FF6B6B":"#fff",fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                    {sec.enabled?"Disable":"Enable"}
+                  </button>
+                </div>
+              </div>
+
+              {sec.enabled&&<>
+                {/* Change PIN */}
+                <div style={{background:T.row,borderRadius:12,padding:"14px",marginBottom:10}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div>
+                      <div style={{fontSize:13,fontWeight:700,color:T.txt}}>Change PIN</div>
+                      <div style={{fontSize:10,color:T.sub,marginTop:2}}>Update your current PIN</div>
+                    </div>
+                    <button onClick={()=>setSecModal("change")} className="btnS" style={{padding:"6px 12px",fontSize:11}}>Change</button>
+                  </div>
+                </div>
+
+                {/* Auto-lock */}
+                <div style={{background:T.row,borderRadius:12,padding:"14px",marginBottom:10}}>
+                  <div style={{fontSize:13,fontWeight:700,color:T.txt,marginBottom:8}}>Auto-lock</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7}}>
+                    {[{v:5,l:"5 min"},{v:15,l:"15 min"},{v:30,l:"30 min"},{v:0,l:"Never"}].map(opt=>(
+                      <button key={opt.v} onClick={()=>{ const s={...sec,autoLock:opt.v}; setSec(s); secSave(s); showToast("Auto-lock: "+opt.l); }}
+                        style={{background:sec.autoLock===opt.v?"linear-gradient(135deg,#7c6aff,#c084fc)":"transparent",border:"1px solid "+(sec.autoLock===opt.v?"transparent":T.bdr),borderRadius:10,padding:"9px",color:sec.autoLock===opt.v?"#fff":T.sub,fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                        {opt.l}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Lock now */}
+                <button onClick={()=>{ setModal(null); clearUnlock(); setLocked(true); }} className="btnP" style={{background:"rgba(255,107,107,.15)",border:"1px solid rgba(255,107,107,.3)",color:"#FF6B6B"}}>
+                  Lock Now
+                </button>
+              </>}
+
+              {/* Security info */}
+              <div style={{marginTop:12,padding:"10px 12px",background:"rgba(124,106,255,.06)",border:"1px solid rgba(124,106,255,.12)",borderRadius:10,fontSize:10,color:"#a78bfa",lineHeight:1.6}}>
+                PIN is hashed with SHA-256 and never stored in plain text. Your data stays on this device only.
+              </div>
+            </>
+          )}
         </>}
       </div></div>}
 
@@ -1855,6 +2176,7 @@ export default function App(){
             {label:"Exchange Rate",   desc:"1 AED = "+rate+" rupees (manual)",                                           icon:"💱",action:()=>{setRateInput(String(rate));setModal("rate");}},
             {label:"Achievements",    desc:badges.length+" of "+BADGE_DEFS.length+" badges earned",                      icon:"🏅",action:()=>setBadgeModal(true)},
             {label:"Backup and Restore",desc:"Export, download, restore data",                                           icon:"💾",action:()=>setBackupModal(true)},
+            {label:"Security",         desc:sec.enabled?"PIN enabled · Auto-lock: "+(sec.autoLock===0?"Never":sec.autoLock+"min"):"PIN protection off",icon:"🔐",action:()=>setModal("security")},
           ].map((r,i)=>(
             <div key={i} className="card mrow" style={{marginBottom:8,border:"1px solid "+(r.warn?"rgba(255,107,107,.2)":T.bdr),cursor:"pointer",transition:"border .15s",animation:"fadeUp .25s ease "+(i*.04)+"s both"}}
               onClick={r.action}
